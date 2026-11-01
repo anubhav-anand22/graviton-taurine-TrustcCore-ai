@@ -1,0 +1,202 @@
+//! Headless end-to-end run of the full pipeline against a live Ollama server and
+//! real files. This is the Phase 2 verification gate that needs models running.
+//!
+//! ```text
+//! cargo run -p workbench-core --example e2e -- "<prompt>" [file ...]
+//! ```
+//!
+//! Env overrides: `WB_LLM`, `WB_VISION`, `WB_EMBED`, `WB_DATA_DIR`, `WB_KB_DIR`,
+//! `WB_MODELS_DIR` (whisper/ocrs model files).
+//!
+//! Ends with a per-model-call timing table — the before/after benchmark for any
+//! performance change. Compare runs on the same machine, model, prompt and files.
+
+use std::path::PathBuf;
+
+use workbench_core::engine::schemas::{FileKind, InputFile};
+use workbench_core::engine::{CallTiming, OllamaEngine};
+use workbench_core::events::{ProgressSink, StepEvent};
+use workbench_core::tools::default_registry;
+use workbench_core::{run_turn, PipelineConfig, TurnOutcome};
+
+/// Prints each pipeline checkpoint as it happens.
+struct StdoutSink;
+impl ProgressSink for StdoutSink {
+    fn emit(&self, event: StepEvent) {
+        match &event {
+            StepEvent::Done { .. } => println!("  * done"),
+            // The full answer-so-far, ~3x a second: noise here, and the final
+            // text is in the report anyway.
+            StepEvent::Streaming { .. } => {}
+            other => println!("  * {}", serde_json::to_string(other).unwrap_or_default()),
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let mut args = std::env::args().skip(1);
+    let prompt = args.next().unwrap_or_else(|| {
+        "Assess corrosion risk on pump P-101 and check it against our SOPs.".to_string()
+    });
+    let file_args: Vec<String> = args.collect();
+
+    // Same thread budget as the app (physical cores - 1, see the Tauri host's
+    // `physical_worker_threads`). Without this the crate falls back to a
+    // logical/2 guess, which on a CPU without hyperthreading is far fewer
+    // threads than the app uses, and the timings stop being comparable.
+    let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let physical = sysinfo::System::new()
+        .physical_core_count()
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| (logical / 2).max(1))
+        .min(logical);
+    workbench_core::init_thread_pools(physical.saturating_sub(1).max(1));
+
+    let data_dir = env_path("WB_DATA_DIR", "target/e2e-data");
+    let kb_dir = env_path("WB_KB_DIR", "crates/workbench-core/kb");
+    let models_dir = std::env::var("WB_MODELS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| app_data_dir().join("models"));
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let config = PipelineConfig {
+        data_dir,
+        kb_dir,
+        ollama_url: "http://127.0.0.1:11434".to_string(),
+        llm_model: std::env::var("WB_LLM").unwrap_or_else(|_| "llama3.2:3b".to_string()),
+        vision_model: std::env::var("WB_VISION").unwrap_or_else(|_| "moondream".to_string()),
+        embed_model: std::env::var("WB_EMBED").unwrap_or_else(|_| "nomic-embed-text".to_string()),
+        whisper_model_path: models_dir.join("ggml-base.en.bin"),
+        ocr_detection_model: models_dir.join("text-detection.rten"),
+        ocr_recognition_model: models_dir.join("text-recognition.rten"),
+    };
+
+    let uploads: Vec<InputFile> = file_args
+        .iter()
+        .map(|p| {
+            let path = PathBuf::from(p);
+            InputFile {
+                kind: FileKind::from_path(&path),
+                original_name: path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file")
+                    .to_string(),
+                path: path
+                    .canonicalize()
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .into_owned(),
+            }
+        })
+        .collect();
+
+    println!("prompt : {prompt}");
+    println!(
+        "files  : {:?}",
+        uploads
+            .iter()
+            .map(|f| format!("{} [{:?}]", f.original_name, f.kind))
+            .collect::<Vec<_>>()
+    );
+    println!(
+        "models : llm={} vision={} embed={}",
+        config.llm_model, config.vision_model, config.embed_model
+    );
+    println!(
+        "threads: {} (physical cores {physical}, logical {logical})",
+        workbench_core::worker_threads()
+    );
+    println!("---- run ----");
+
+    let engine = OllamaEngine::new(
+        &config.ollama_url,
+        config.llm_model.clone(),
+        config.vision_model.clone(),
+        config.embed_model.clone(),
+    );
+    let registry = default_registry();
+
+    let turn_started = std::time::Instant::now();
+    let outcome = run_turn(
+        &engine,
+        &registry,
+        &config,
+        "e2e-session",
+        &prompt,
+        &uploads,
+        &StdoutSink,
+    )
+    .await;
+    // Printed even when the turn fails: a timeout is exactly when you want it.
+    print_timings(&engine.timings(), turn_started.elapsed());
+
+    match outcome {
+        Ok(TurnOutcome::Completed(report)) => {
+            println!("\n==== FINAL REPORT ====");
+            println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        }
+        Ok(TurnOutcome::AwaitingUser { errors, plan_json }) => {
+            println!("\n==== AWAITING USER ====");
+            for e in errors {
+                println!("  - {e}");
+            }
+            println!("last plan: {plan_json}");
+        }
+        Err(e) => {
+            eprintln!("\n!! pipeline error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// One row per model call, then totals. `-` = Ollama gave no figure (always the
+/// case for embeddings, which report wall time only).
+fn print_timings(calls: &[CallTiming], turn: std::time::Duration) {
+    let opt = |v: Option<u64>| v.map_or("-".to_string(), |n| n.to_string());
+    let secs = |ms: u128| format!("{:.1}", ms as f64 / 1000.0);
+
+    println!("\n==== TIMING ====");
+    println!(
+        "{:<16} {:>8} {:>8} {:>8} {:>10} {:>8} {:>10} {:>7}",
+        "role", "wall_s", "load_ms", "p_tok", "prefill_ms", "gen_tok", "decode_ms", "tok/s"
+    );
+    for c in calls {
+        println!(
+            "{:<16} {:>8} {:>8} {:>8} {:>10} {:>8} {:>10} {:>7}",
+            c.role,
+            secs(c.wall_ms),
+            opt(c.load_ms),
+            opt(c.prompt_tokens),
+            opt(c.prefill_ms),
+            opt(c.gen_tokens),
+            opt(c.decode_ms),
+            c.decode_tok_per_s().map_or("-".to_string(), |v| format!("{v:.1}")),
+        );
+    }
+    let sum = |f: fn(&CallTiming) -> Option<u64>| calls.iter().filter_map(f).sum::<u64>() as u128;
+    let model_ms: u128 = calls.iter().map(|c| c.wall_ms).sum();
+    println!(
+        "model calls: {}  |  model wall {}s  (load {}s, prefill {}s, decode {}s)  |  turn wall {}s",
+        calls.len(),
+        secs(model_ms),
+        secs(sum(|c| c.load_ms)),
+        secs(sum(|c| c.prefill_ms)),
+        secs(sum(|c| c.decode_ms)),
+        secs(turn.as_millis()),
+    );
+}
+
+fn env_path(key: &str, default: &str) -> PathBuf {
+    std::env::var(key)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(default))
+}
+
+fn app_data_dir() -> PathBuf {
+    std::env::var("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join("com.anubhav_anand.tauri-app")
+}

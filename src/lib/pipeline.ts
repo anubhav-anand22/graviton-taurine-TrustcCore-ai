@@ -1,0 +1,317 @@
+// Thin wrappers around the Tauri command layer. Every backend call the UI makes
+// goes through here so component code stays declarative.
+
+import { invoke, Channel } from "@tauri-apps/api/core";
+import { log, timed, type Fields } from "./log";
+import type {
+  AuditPaths,
+  LlmAssessment,
+  MemoryFact,
+  MeshStatus,
+  ModelPlan,
+  ModelProgress,
+  SessionContext,
+  SessionMeta,
+  StepEvent,
+  SystemProbe,
+  UploadedFile,
+  UserProfile,
+} from "../types";
+
+/** Is Ollama available (server responding, on PATH, or in a known location)? */
+export const isOllamaInstalled = () =>
+  timed("is_ollama_installed", undefined, () =>
+    invoke<boolean>("is_ollama_installed"),
+  );
+
+/** Install Ollama if missing, streaming progress lines. */
+export function ensureOllamaInstalled(onLine: (line: string) => void) {
+  const channel = new Channel<string>();
+  channel.onmessage = (line) => {
+    log.info("ollama install", { line });
+    onLine(line);
+  };
+  return timed("ensure_ollama_installed", undefined, () =>
+    invoke<boolean>("ensure_ollama_installed", { onProgress: channel }),
+  );
+}
+
+/** The stored profile, or null on first launch (→ show the profile screen). */
+export const getProfile = () =>
+  timed("get_profile", undefined, () => invoke<UserProfile | null>("get_profile"));
+
+/** Store the profile from the first screen. */
+export const saveProfile = (profile: UserProfile) =>
+  timed(
+    "save_profile",
+    { industry: profile.industry, priority: profile.priority },
+    () => invoke<void>("save_profile", { profile }),
+  );
+
+/** Detected RAM/GPU/cores plus the recommended model tier. */
+export const probeSystem = () =>
+  timed("probe_system", undefined, async () => {
+    const probe = await invoke<SystemProbe>("probe_system");
+    // Logged in full because a wrong tier recommendation is the difference
+    // between a usable app and multi-minute steps.
+    log.info("hardware probed", {
+      ram_gb: probe.hardware.total_ram_gb,
+      cpu_cores: probe.hardware.cpu_cores,
+      gpu: probe.hardware.gpu_name,
+      vram_gb: probe.hardware.vram_gb,
+      cuda: probe.hardware.cuda_available,
+      recommended_llm: probe.recommended.llm,
+      tier: probe.recommended.tier_label,
+    });
+    return probe;
+  });
+
+/** Pull the given models, streaming per-model download progress. */
+export function ensureModels(
+  models: string[],
+  onProgress: (p: ModelProgress) => void,
+) {
+  const channel = new Channel<ModelProgress>();
+  channel.onmessage = onProgress;
+  return timed("ensure_models", { models }, () =>
+    invoke<void>("ensure_models", { models, onProgress: channel }),
+  );
+}
+
+/** Download the OCR (always) and whisper (if the profile wants audio) model
+ *  files when missing. Never rejects for a failed download — that tool is just
+ *  left off, and the progress line says how to install it offline. */
+export function ensureToolModels(onProgress: (p: ModelProgress) => void) {
+  const channel = new Channel<ModelProgress>();
+  channel.onmessage = onProgress;
+  return timed("ensure_tool_models", undefined, () =>
+    invoke<void>("ensure_tool_models", { onProgress: channel }),
+  );
+}
+
+/** Persist the confirmed model plan on the backend. */
+export const setModelPlan = (plan: ModelPlan) =>
+  timed("set_model_plan", { llm: plan.llm, tier: plan.tier_label }, () =>
+    invoke<void>("set_model_plan", { plan }),
+  );
+
+/** Warm the resident model (idempotent). */
+export const warmModel = () =>
+  timed("warm_model", undefined, () => invoke<void>("warm_model"));
+
+/** Risk assessment for running `model` on this host — drives the override warning. */
+export const assessModel = (model: string) =>
+  timed("assess_model", { model }, () =>
+    invoke<LlmAssessment>("assess_model", { model }),
+  );
+
+/** Ask the backend to stop the turn in progress. Safe to call when none is. */
+export const cancelTurn = () => {
+  log.info("user requested turn cancellation");
+  return invoke<void>("cancel_turn").catch((e) =>
+    log.error("cancel_turn failed", { error: String(e) }),
+  );
+};
+
+/** Facts the user has confirmed for cross-chat memory (encrypted on disk). */
+export const getMemory = () =>
+  timed("get_memory", undefined, () => invoke<MemoryFact[]>("get_memory"));
+
+/** Confirm a proposed fact. Returns the updated list. */
+export const confirmMemory = (fact: MemoryFact) =>
+  timed("confirm_memory", { key: fact.key }, () =>
+    invoke<MemoryFact[]>("confirm_memory", { key: fact.key, value: fact.value }),
+  );
+
+/** Forget a remembered fact. Returns the updated list. */
+export const forgetMemory = (key: string) =>
+  timed("forget_memory", { key }, () =>
+    invoke<MemoryFact[]>("forget_memory", { key }),
+  );
+
+/** Past chat sessions, newest first, for the sidebar. */
+export const listSessions = () =>
+  timed("list_sessions", undefined, () =>
+    invoke<SessionMeta[]>("list_sessions"),
+  );
+
+/** Full transcript of one session, to redraw it. */
+export const loadSession = (sessionId: string) =>
+  timed("load_session", { sessionId }, () =>
+    invoke<SessionContext>("load_session", { sessionId }),
+  );
+
+/** Delete a session file. Confirmed cross-chat facts are separate and kept. */
+export const deleteSession = (sessionId: string) =>
+  timed("delete_session", { sessionId }, () =>
+    invoke<void>("delete_session", { sessionId }),
+  );
+
+/** Rename a session (sidebar title). */
+export const renameSession = (sessionId: string, title: string) =>
+  timed("rename_session", { sessionId }, () =>
+    invoke<void>("rename_session", { sessionId, title }),
+  );
+
+/** Absolute on-disk paths for the audit sidebar. */
+export const auditPaths = () => invoke<AuditPaths>("audit_paths");
+
+/** Open the log directory in the OS file manager. Returns the path. */
+export const openLogDir = () => invoke<string>("open_log_dir");
+
+/**
+ * Run one turn. Streams `StepEvent`s to `onEvent`; resolves when the backend
+ * command returns (i.e. the turn is finished or errored).
+ */
+/** "fast" = retrieve then answer; "deep" = read the whole document in passes. */
+export type TurnMode = "fast" | "deep";
+
+export function submitTurn(
+  args: {
+    prompt: string;
+    sessionId: string;
+    files: UploadedFile[];
+    mode?: TurnMode;
+  },
+  onEvent: (e: StepEvent) => void,
+) {
+  const channel = new Channel<StepEvent>();
+  channel.onmessage = logStepEvent(onEvent);
+  return timed(
+    "submit_turn",
+    {
+      sessionId: args.sessionId,
+      prompt_chars: args.prompt.length,
+      files: args.files.map((f) => f.name),
+      mode: args.mode ?? "fast",
+    },
+    () =>
+      invoke<void>("submit_turn", {
+        prompt: args.prompt,
+        sessionId: args.sessionId,
+        files: args.files,
+        mode: args.mode ?? "fast",
+        onEvent: channel,
+      }),
+  );
+}
+
+/**
+ * Wrap a StepEvent handler so every pipeline event is logged as it arrives.
+ *
+ * These are the timeline of a turn as the UI saw it. Logging them here (rather
+ * than in each component) means the record is identical no matter which screen
+ * is mounted, and it survives the component unmounting mid-turn.
+ */
+function logStepEvent(inner: (e: StepEvent) => void) {
+  return (e: StepEvent) => {
+    switch (e.stage) {
+      case "streaming":
+        // ~3 per second while a model writes, each carrying the full text so
+        // far. Not worth a log line each; the call's timing is logged when it ends.
+        break;
+      case "error":
+        log.error("pipeline event: error", { message: e.message });
+        break;
+      case "awaiting_user":
+        log.warn("pipeline event: awaiting_user (HITL)", { errors: e.errors });
+        break;
+      case "warning":
+        log.warn("pipeline event: warning", {
+          message: e.message,
+          detail: e.detail ?? undefined,
+        });
+        break;
+      case "tool_finished":
+        log[e.ok ? "info" : "error"]("pipeline event: tool_finished", {
+          tool: e.tool,
+          ok: e.ok,
+          elapsed_ms: e.elapsed_ms,
+        });
+        break;
+      case "quality_check":
+        log[e.passed ? "info" : "warn"]("pipeline event: quality_check", {
+          passed: e.passed,
+        });
+        break;
+      default:
+        log.debug(`pipeline event: ${e.stage}`, e as unknown as Fields);
+    }
+    inner(e);
+  };
+}
+
+/**
+ * Resume a parked turn with the plan the user reviewed in the HITL modal.
+ * `force: true` skips re-validation ("run anyway"); otherwise a still-invalid
+ * plan re-emits an `awaiting_user` event. Streams `StepEvent`s like `submitTurn`.
+ */
+export function resumeTurn(
+  args: {
+    prompt: string;
+    sessionId: string;
+    files: UploadedFile[];
+    planJson: string;
+    force: boolean;
+    mode?: TurnMode;
+  },
+  onEvent: (e: StepEvent) => void,
+) {
+  const channel = new Channel<StepEvent>();
+  channel.onmessage = logStepEvent(onEvent);
+  return timed(
+    "resume_turn",
+    { sessionId: args.sessionId, force: args.force },
+    () =>
+      invoke<void>("resume_turn", {
+        prompt: args.prompt,
+        sessionId: args.sessionId,
+        files: args.files,
+        planJson: args.planJson,
+        force: args.force,
+        mode: args.mode ?? "fast",
+        onEvent: channel,
+      }),
+  );
+}
+
+// --- LAN mesh (src-tauri/src/mesh.rs, docs/12-mesh.md) ------------------------------
+
+/** Polled every second or so: deliberately not `timed`, or the log fills with it. */
+export const meshStatus = () => invoke<MeshStatus>("mesh_status");
+
+export const meshStartHost = () => timed("mesh_start_host", undefined, () => invoke<MeshStatus>("mesh_start_host"));
+export const meshNewCode = () => timed("mesh_new_code", undefined, () => invoke<MeshStatus>("mesh_new_code"));
+export const meshApprove = (deviceId: string) =>
+  timed("mesh_approve", { deviceId }, () => invoke<MeshStatus>("mesh_approve", { deviceId }));
+export const meshRemove = (deviceId: string) =>
+  timed("mesh_remove", { deviceId }, () => invoke<MeshStatus>("mesh_remove", { deviceId }));
+export const meshPinDelegator = (deviceId: string | null) =>
+  timed("mesh_pin_delegator", { deviceId }, () => invoke<MeshStatus>("mesh_pin_delegator", { deviceId }));
+/** The code itself is never logged. */
+export const meshJoin = (code: string, address: string | null) =>
+  timed("mesh_join", { manualAddress: !!address }, () => invoke<MeshStatus>("mesh_join", { code, address }));
+export const meshReconnect = (deviceId: string) =>
+  timed("mesh_reconnect", { deviceId }, () => invoke<MeshStatus>("mesh_reconnect", { deviceId }));
+export const meshForgetHost = (deviceId: string) =>
+  timed("mesh_forget_host", { deviceId }, () => invoke<MeshStatus>("mesh_forget_host", { deviceId }));
+export const meshSetThreads = (threads: number) =>
+  timed("mesh_set_threads", { threads }, () => invoke<MeshStatus>("mesh_set_threads", { threads }));
+export const meshSetLendGpu = (lend: boolean) =>
+  timed("mesh_set_lend_gpu", { lend }, () => invoke<MeshStatus>("mesh_set_lend_gpu", { lend }));
+export const meshLeave = () => timed("mesh_leave", undefined, () => invoke<MeshStatus>("mesh_leave"));
+
+/** Read a File into the base64 shape `submit_turn` expects. */
+export function fileToUpload(file: File): Promise<UploadedFile> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error);
+    reader.onload = () => {
+      // reader.result is a data URL: "data:<mime>;base64,<payload>"
+      const result = String(reader.result);
+      const comma = result.indexOf(",");
+      resolve({ name: file.name, content_base64: result.slice(comma + 1) });
+    };
+    reader.readAsDataURL(file);
+  });
+}

@@ -1,0 +1,44 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+# Shared: keeps rust-analyzer from fighting terminal builds over the target/ lock.
+!.vscode/settings.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Rust / Cargo
+/target
+# workspace lock lives at the root now; the stale member lock is not used
+/src-tauri/Cargo.lock
+
+# Runtime data written by the app (uploads, vector store, memory, model files)
+/src-tauri/**/data/
+**/workbench-core/data/
+*.rten
+*.gguf
+ggml-*.bin
+
+# Local model cache / scratch
+/models/
+
+# demo fixtures are generated, not committed
+demo/fixtures/

@@ -1,0 +1,289 @@
+//! Phase 1 gate: the planner retries a rejected plan at most twice. If it still
+//! has no valid plan it builds a deterministic fallback (Stage 3) rather than
+//! dead-ending — and only parks for the user if even that fallback cannot run
+//! (e.g. an attachment missing from disk). A valid plan on the last allowed
+//! attempt is still accepted.
+
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use async_trait::async_trait;
+use workbench_core::engine::schemas::{FileKind, InputFile, IntentResult, Plan, TaskStep};
+use workbench_core::events::VecSink;
+use workbench_core::planner::{plan_turn, PlanOutcome, PlanSource, MAX_PLAN_ATTEMPTS};
+use workbench_core::{CoreError, Result};
+
+fn bogus_plan() -> Plan {
+    Plan {
+        steps: vec![TaskStep {
+            id: "s1".into(),
+            task: "not_a_real_task".into(),
+            args: serde_json::Value::Null,
+            depends_on: vec![],
+        }],
+    }
+}
+
+fn valid_plan() -> Plan {
+    Plan {
+        steps: vec![TaskStep {
+            id: "s1".into(),
+            task: "search_knowledge".into(),
+            args: serde_json::Value::Null,
+            depends_on: vec![],
+        }],
+    }
+}
+
+fn intent(needs_knowledge: bool) -> IntentResult {
+    IntentResult {
+        intents: vec!["inspect".into()],
+        file_kinds: vec![],
+        needs_knowledge,
+    }
+}
+
+/// Never produces a valid plan.
+struct AlwaysInvalid {
+    build_calls: AtomicU32,
+    needs_knowledge: bool,
+}
+
+#[async_trait]
+impl PlanSource for AlwaysInvalid {
+    async fn parse_intent(&self, _p: &str, _h: &str, _u: &[InputFile]) -> Result<IntentResult> {
+        Ok(intent(self.needs_knowledge))
+    }
+    async fn build_plan(
+        &self,
+        _p: &str,
+        _h: &str,
+        _i: &IntentResult,
+        _u: &[InputFile],
+        _e: &[String],
+    ) -> Result<Plan> {
+        self.build_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(bogus_plan())
+    }
+}
+
+/// With something to work on (an attachment, or knowledge to fetch), an
+/// exhausted planner produces a deterministic fallback plan, not a dead end.
+#[tokio::test]
+async fn exhausted_planner_falls_back_instead_of_parking() {
+    let src = AlwaysInvalid {
+        build_calls: AtomicU32::new(0),
+        needs_knowledge: true,
+    };
+    let sink = VecSink::new();
+
+    let (_intent, outcome) = plan_turn(&src, "do the thing", &[], "", false, &sink).await.unwrap();
+
+    match outcome {
+        PlanOutcome::Ready(plan) => {
+            assert!(!plan.steps.is_empty(), "fallback plan must have steps");
+            assert!(
+                plan.steps.iter().any(|s| s.task == "search_knowledge"),
+                "needs_knowledge fallback should search the KB: {plan:?}"
+            );
+        }
+        other => panic!("expected a fallback Ready plan, got {other:?}"),
+    }
+
+    // Still exactly 1 initial call + 2 retries before the fallback.
+    assert_eq!(src.build_calls.load(Ordering::SeqCst), MAX_PLAN_ATTEMPTS);
+    assert!(
+        sink.stages().contains(&"warning".to_string()),
+        "the user must be told a fallback plan was used; stages: {:?}",
+        sink.stages()
+    );
+}
+
+/// Nothing attached, no knowledge needed, no history — "hi" on a fresh chat.
+/// This used to be treated as the one genuine dead end (the fallback came back
+/// empty and the turn parked). With `answer_directly` it answers instead.
+#[tokio::test]
+async fn bare_first_message_falls_back_to_answer_directly() {
+    let src = AlwaysInvalid {
+        build_calls: AtomicU32::new(0),
+        needs_knowledge: false,
+    };
+    let sink = VecSink::new();
+
+    let (_intent, outcome) = plan_turn(&src, "hi", &[], "", false, &sink).await.unwrap();
+
+    match outcome {
+        PlanOutcome::Ready(plan) => {
+            assert_eq!(plan.steps.len(), 1, "{plan:?}");
+            assert_eq!(plan.steps[0].task, "answer_directly");
+        }
+        other => panic!("expected an answer_directly fallback, got {other:?}"),
+    }
+    assert_eq!(src.build_calls.load(Ordering::SeqCst), MAX_PLAN_ATTEMPTS);
+}
+
+/// The park path still exists for a fallback that genuinely cannot run: an
+/// attachment that vanished from disk between upload and planning.
+#[tokio::test]
+async fn fallback_that_cannot_run_still_parks() {
+    let src = AlwaysInvalid {
+        build_calls: AtomicU32::new(0),
+        needs_knowledge: false,
+    };
+    let sink = VecSink::new();
+    let gone = vec![InputFile {
+        path: "/definitely/not/here/report.pdf".into(),
+        kind: FileKind::Pdf,
+        original_name: "report.pdf".into(),
+    }];
+
+    let (_intent, outcome) = plan_turn(&src, "read this", &gone, "", false, &sink)
+        .await
+        .unwrap();
+
+    match outcome {
+        PlanOutcome::AwaitingUser { errors, .. } => {
+            assert!(!errors.is_empty(), "HITL hand-off must carry the errors")
+        }
+        other => panic!("expected AwaitingUser, got {other:?}"),
+    }
+    assert_eq!(
+        sink.stages().last().map(String::as_str),
+        Some("awaiting_user"),
+        "stepper must end on awaiting_user; got {:?}",
+        sink.stages()
+    );
+}
+
+/// A fallback built from real attachments should be executable as-is.
+#[tokio::test]
+async fn fallback_from_attachments_is_valid() {
+    use workbench_core::planner::validate_plan;
+
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("north.jpg");
+    std::fs::write(&img, b"x").unwrap();
+    let uploads = vec![InputFile {
+        path: img.to_string_lossy().into_owned(),
+        kind: FileKind::Image,
+        original_name: "north.jpg".into(),
+    }];
+
+    let src = AlwaysInvalid {
+        build_calls: AtomicU32::new(0),
+        needs_knowledge: false,
+    };
+    let sink = VecSink::new();
+    let (_intent, outcome) = plan_turn(&src, "inspect", &uploads, "", false, &sink).await.unwrap();
+
+    let PlanOutcome::Ready(plan) = outcome else {
+        panic!("expected a fallback Ready plan");
+    };
+    assert!(validate_plan(&plan, &uploads).is_empty());
+    assert!(plan.steps.iter().any(|s| s.task == "analyze_image"));
+}
+
+/// Invalid for the first two build calls, valid on the third (last allowed) one.
+struct ValidOnLastAttempt {
+    build_calls: AtomicU32,
+}
+
+#[async_trait]
+impl PlanSource for ValidOnLastAttempt {
+    async fn parse_intent(&self, _p: &str, _h: &str, _u: &[InputFile]) -> Result<IntentResult> {
+        Ok(intent(true))
+    }
+    async fn build_plan(
+        &self,
+        _p: &str,
+        _h: &str,
+        _i: &IntentResult,
+        _u: &[InputFile],
+        _e: &[String],
+    ) -> Result<Plan> {
+        let prior = self.build_calls.fetch_add(1, Ordering::SeqCst);
+        if prior < 2 {
+            Ok(bogus_plan())
+        } else {
+            Ok(valid_plan())
+        }
+    }
+}
+
+/// Fails every build call the way a real model or a real Stop does.
+struct FailingPlanner {
+    build_calls: AtomicU32,
+    cancelled: bool,
+}
+
+#[async_trait]
+impl PlanSource for FailingPlanner {
+    async fn parse_intent(&self, _p: &str, _h: &str, _u: &[InputFile]) -> Result<IntentResult> {
+        Ok(intent(false))
+    }
+    async fn build_plan(
+        &self,
+        _p: &str,
+        _h: &str,
+        _i: &IntentResult,
+        _u: &[InputFile],
+        _e: &[String],
+    ) -> Result<Plan> {
+        self.build_calls.fetch_add(1, Ordering::SeqCst);
+        if self.cancelled {
+            return Err(CoreError::Cancelled);
+        }
+        // The lead's 2026-11-01 failure: 640 tokens of invented image steps, cut
+        // off mid-string ("EOF while parsing a string").
+        let cut = r#"{"steps":[{"id":"1","task":"parse_pdf","args":{},"depends_on":[]},{"id":"2","task":"analyze_image","args":{"file":"image1.jp"#;
+        let source = serde_json::from_str::<Plan>(cut).unwrap_err();
+        Err(CoreError::Schema { role: "task_planner", source })
+    }
+}
+
+/// Malformed plan JSON used to end the turn with an error. It now goes straight
+/// to the fallback (no retries: a cut-off generation tends to repeat and costs
+/// ~50 s each on CPU) — here, a follow-up answered from the conversation.
+#[tokio::test]
+async fn malformed_plan_json_falls_back_without_retrying() {
+    let src = FailingPlanner { build_calls: AtomicU32::new(0), cancelled: false };
+    let sink = VecSink::new();
+
+    let (_intent, outcome) = plan_turn(&src, "give me a plan on how to implement", &[], "earlier turns", true, &sink)
+        .await
+        .expect("a malformed plan must not fail the turn");
+
+    let PlanOutcome::Ready(plan) = outcome else {
+        panic!("expected a fallback Ready plan, got {outcome:?}");
+    };
+    assert_eq!(plan.steps.len(), 1, "{plan:?}");
+    assert_eq!(plan.steps[0].task, "answer_followup");
+    assert_eq!(src.build_calls.load(Ordering::SeqCst), 1, "no retries after malformed JSON");
+    assert!(sink.stages().contains(&"warning".to_string()), "stages: {:?}", sink.stages());
+}
+
+/// Only malformed JSON is absorbed. Stop still ends the turn.
+#[tokio::test]
+async fn cancel_during_planning_still_ends_the_turn() {
+    let src = FailingPlanner { build_calls: AtomicU32::new(0), cancelled: true };
+    let sink = VecSink::new();
+
+    let err = plan_turn(&src, "p", &[], "", false, &sink).await.unwrap_err();
+    assert!(matches!(err, CoreError::Cancelled), "got {err:?}");
+    assert_eq!(src.build_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn recovers_on_last_allowed_attempt() {
+    let src = ValidOnLastAttempt {
+        build_calls: AtomicU32::new(0),
+    };
+    let sink = VecSink::new();
+
+    let (_intent, outcome) = plan_turn(&src, "p", &[], "", false, &sink).await.unwrap();
+
+    assert!(
+        matches!(outcome, PlanOutcome::Ready(_)),
+        "a valid plan on attempt 3 must be accepted"
+    );
+    assert_eq!(src.build_calls.load(Ordering::SeqCst), 3);
+}
